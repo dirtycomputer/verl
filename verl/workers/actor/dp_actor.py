@@ -282,9 +282,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # compute all_log_probs for full KL
                     if return_all_log_probs:
-                        all_log_probs_rmpad = torch.nn.functional.log_softmax(
-                            logits_rmpad, dim=-1
-                        )  # (total_nnz, vocab_size)
+                        # Store raw logits (after temperature scaling) to enable Triton-fused KL
+                        all_log_probs_rmpad = logits_rmpad.clone()  # (total_nnz, vocab_size)
 
                     # compute entropy
                     if calculate_entropy:
@@ -408,7 +407,8 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if return_all_log_probs:
-                        all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                        # Store raw logits (after temperature scaling) to enable Triton-fused KL
+                        all_log_probs = logits.clone()
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)

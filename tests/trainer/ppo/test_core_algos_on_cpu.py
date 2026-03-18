@@ -318,58 +318,59 @@ class TestKLPenaltyFull(unittest.TestCase):
 
     def test_full_kl_identical_distributions(self):
         """KL divergence of identical distributions should be zero."""
-        from verl.trainer.ppo.core_algos import kl_penalty_forward
+        from verl.utils.kernel.fused_kl import _kl_from_logits_pytorch
 
         batch_size, seq_len, vocab_size = 2, 4, 10
         logits = torch.randn(batch_size, seq_len, vocab_size)
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        kld = kl_penalty_forward(log_probs, log_probs, kl_penalty="full")
+        kld = _kl_from_logits_pytorch(logits, logits)
         assert kld.shape == (batch_size, seq_len)
         assert torch.allclose(kld, torch.zeros_like(kld), atol=1e-6)
 
     def test_full_kl_non_negative(self):
         """KL divergence should always be non-negative."""
-        from verl.trainer.ppo.core_algos import kl_penalty_forward
+        from verl.utils.kernel.fused_kl import _kl_from_logits_pytorch
 
         batch_size, seq_len, vocab_size = 4, 8, 100
         logits_p = torch.randn(batch_size, seq_len, vocab_size)
         logits_q = torch.randn(batch_size, seq_len, vocab_size)
-        log_p = torch.nn.functional.log_softmax(logits_p, dim=-1)
-        log_q = torch.nn.functional.log_softmax(logits_q, dim=-1)
 
-        kld = kl_penalty_forward(log_p, log_q, kl_penalty="full")
+        kld = _kl_from_logits_pytorch(logits_p, logits_q)
         assert (kld >= 0).all(), f"KL divergence should be non-negative, got min={kld.min().item()}"
 
     def test_full_kl_known_value(self):
         """Test against manually computed KL divergence."""
-        from verl.trainer.ppo.core_algos import kl_penalty_forward
+        from verl.utils.kernel.fused_kl import _kl_from_logits_pytorch
 
         # Two simple distributions: p = [0.7, 0.2, 0.1], q = [0.3, 0.4, 0.3]
         p = torch.tensor([0.7, 0.2, 0.1])
         q = torch.tensor([0.3, 0.4, 0.3])
         expected_kl = (p * (p.log() - q.log())).sum()
 
-        log_p = p.log().unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
-        log_q = q.log().unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
+        # Use logits that produce these distributions via softmax
+        # log(p) are valid logits since softmax(log(p)) ∝ p (up to normalization)
+        # We use the log-probabilities directly as logits
+        logits_p = p.log().unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
+        logits_q = q.log().unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
 
-        kld = kl_penalty_forward(log_p, log_q, kl_penalty="full")
+        kld = _kl_from_logits_pytorch(logits_p, logits_q)
         assert kld.shape == (1, 1)
         assert torch.allclose(kld, expected_kl.unsqueeze(0).unsqueeze(0), atol=1e-5)
 
-    def test_full_kl_via_wrapper(self):
-        """Test that the kl_penalty wrapper correctly delegates to kl_penalty_forward for 'full'."""
-        from verl.trainer.ppo.core_algos import kl_penalty as kl_penalty_fn
+    def test_full_kl_fused_matches_pytorch(self):
+        """Test that the fused function matches PyTorch reference."""
+        from verl.utils.kernel.fused_kl import _kl_from_logits_pytorch, fused_kl_from_logits
 
-        batch_size, seq_len, vocab_size = 2, 4, 10
+        batch_size, seq_len, vocab_size = 4, 8, 50
         logits_p = torch.randn(batch_size, seq_len, vocab_size)
         logits_q = torch.randn(batch_size, seq_len, vocab_size)
-        log_p = torch.nn.functional.log_softmax(logits_p, dim=-1)
-        log_q = torch.nn.functional.log_softmax(logits_q, dim=-1)
 
-        kld = kl_penalty_fn(log_p, log_q, kl_penalty="full")
-        assert kld.shape == (batch_size, seq_len)
-        assert (kld >= 0).all()
+        kld_ref = _kl_from_logits_pytorch(logits_p, logits_q)
+        kld_fused = fused_kl_from_logits(logits_p, logits_q)
+        assert kld_fused.shape == (batch_size, seq_len)
+        assert torch.allclose(kld_ref, kld_fused, atol=1e-4), (
+            f"Fused KL doesn't match PyTorch reference. Max diff: {(kld_ref - kld_fused).abs().max().item()}"
+        )
 
 
 if __name__ == "__main__":

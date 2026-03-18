@@ -2181,12 +2181,12 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
-        # logprob and ref_logprob are log_softmax outputs (full vocab log probs)
+        # logprob and ref_logprob are raw logits (after temperature scaling)
         # shape: (batch_size, response_length, vocab_size)
-        # KL(π || π_ref) = Σ_v π(v) * (log π(v) - log π_ref(v))
-        kld = (logprob.exp() * (logprob - ref_logprob)).sum(dim=-1)
-        # Clamp to 0 to handle floating point errors (KL is non-negative)
-        return torch.clamp(kld, min=0.0)
+        # Use Triton-fused kernel when available for memory efficiency
+        from verl.utils.kernel.fused_kl import fused_kl_from_logits
+
+        return fused_kl_from_logits(logprob, ref_logprob)
 
     raise NotImplementedError
 
