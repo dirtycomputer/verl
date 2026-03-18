@@ -88,9 +88,15 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
-    )  # (batch_size, response_length)
+    if kl_penalty == "full":
+        # For full KL, use full vocab log probs (batch_size, response_length, vocab_size)
+        kld = core_algos.kl_penalty(
+            data.batch["old_all_log_probs"], data.batch["ref_all_log_probs"], kl_penalty=kl_penalty
+        )  # (batch_size, response_length)
+    else:
+        kld = core_algos.kl_penalty(
+            data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+        )  # (batch_size, response_length)
     kld = kld * response_mask
     beta = kl_ctrl.value
 
@@ -1105,7 +1111,13 @@ class RayPPOTrainer:
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        need_all_log_probs = self.config.algorithm.kl_penalty == "full"
         if self.use_legacy_worker_impl == "disable":
+            if need_all_log_probs:
+                raise NotImplementedError(
+                    "Full vocab KL (kl_penalty='full') is not yet supported with the engine-based worker. "
+                    "Please use legacy FSDP workers instead."
+                )
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to nopadding
@@ -1127,12 +1139,22 @@ class RayPPOTrainer:
             ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
             ref_log_prob = DataProto.from_tensordict(ref_log_prob)
         else:
+            if need_all_log_probs:
+                batch.meta_info["return_all_log_probs"] = True
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+            if need_all_log_probs:
+                batch.meta_info.pop("return_all_log_probs", None)
 
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        need_all_log_probs = self.config.algorithm.kl_penalty == "full"
         if self.use_legacy_worker_impl == "disable":
+            if need_all_log_probs:
+                raise NotImplementedError(
+                    "Full vocab KL (kl_penalty='full') is not yet supported with the engine-based worker. "
+                    "Please use legacy FSDP workers instead."
+                )
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1158,7 +1180,11 @@ class RayPPOTrainer:
                 old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            if need_all_log_probs:
+                batch.meta_info["return_all_log_probs"] = True
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            if need_all_log_probs:
+                batch.meta_info.pop("return_all_log_probs", None)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 

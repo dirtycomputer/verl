@@ -1124,6 +1124,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["entropys"] = outputs["entropys"]
             if "sum_pi_squared" in outputs:
                 tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            if "all_log_probs" in outputs:
+                key = "old_all_log_probs" if not is_lora else "ref_all_log_probs"
+                tensors[key] = outputs["all_log_probs"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1162,7 +1165,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
             outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+            tensors = {"ref_log_prob": outputs["log_probs"]}
+            if "all_log_probs" in outputs:
+                tensors["ref_all_log_probs"] = outputs["all_log_probs"]
+            output = DataProto.from_dict(tensors=tensors)
 
         output = output.to("cpu")
 

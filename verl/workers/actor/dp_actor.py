@@ -111,7 +111,11 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        return_all_log_probs: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -119,8 +123,10 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs: (bs, response_len)
                 if calculate_entropy is True:
                     entropys: (bs, response_len)
-                if calculate_sum_pi_squared is False:
+                if calculate_sum_pi_squared is True:
                     sum_pi_squared: (bs, response_len)
+                if return_all_log_probs is True:
+                    all_log_probs: (bs, response_len, vocab_size)
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
@@ -253,6 +259,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                    if return_all_log_probs:
+                        raise NotImplementedError(
+                            "return_all_log_probs (for full KL) is not supported with fused kernels"
+                        )
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -262,11 +272,19 @@ class DataParallelPPOActor(BasePPOActor):
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
+                    if return_all_log_probs:
+                        inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
+
+                    # compute all_log_probs for full KL
+                    if return_all_log_probs:
+                        all_log_probs_rmpad = torch.nn.functional.log_softmax(
+                            logits_rmpad, dim=-1
+                        )  # (total_nnz, vocab_size)
 
                     # compute entropy
                     if calculate_entropy:
@@ -307,11 +325,17 @@ class DataParallelPPOActor(BasePPOActor):
                         sum_pi_squared_rmpad = gather_outputs_and_unpad(
                             sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
+                    if return_all_log_probs:
+                        all_log_probs_rmpad = gather_outputs_and_unpad(
+                            all_log_probs_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
+                    if return_all_log_probs:
+                        all_log_probs_rmpad = all_log_probs_rmpad[:0]
 
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
@@ -334,6 +358,14 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if return_all_log_probs:
+                    # all_log_probs_rmpad: (total_nnz, vocab_size) -> (bsz, seqlen, vocab_size)
+                    full_all_log_probs = pad_input(
+                        hidden_states=all_log_probs_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
 
                 # only return response part:
                 if calculate_entropy:
@@ -342,6 +374,9 @@ class DataParallelPPOActor(BasePPOActor):
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if return_all_log_probs:
+                    # (bsz, response_length, vocab_size)
+                    all_log_probs = full_all_log_probs[:, -response_length - 1 : -1, :]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -361,6 +396,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if return_all_log_probs:
+                        raise NotImplementedError(
+                            "return_all_log_probs (for full KL) is not supported with fused kernels"
+                        )
 
                 else:
                     logits = output.logits
@@ -368,6 +407,8 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if return_all_log_probs:
+                        all_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -386,6 +427,8 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if return_all_log_probs:
+                outputs["all_log_probs"] = all_log_probs
             return outputs
 
     def _optimizer_step(self):
@@ -444,6 +487,7 @@ class DataParallelPPOActor(BasePPOActor):
                 - ``sum_pi_squared``: tensor of shape [batch_size, response_length]. torch.float32.
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+        return_all_log_probs = data.meta_info.get("return_all_log_probs", False)
 
         # set to eval
         self.actor_module.eval()
@@ -472,24 +516,32 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         sum_pi_squared_lst = []
+        all_log_probs_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
             with torch.no_grad():
                 outputs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    return_all_log_probs=return_all_log_probs,
                 )
             log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:
                 entropy_lst.append(outputs["entropys"])
             if calculate_sum_pi_squared:
                 sum_pi_squared_lst.append(outputs["sum_pi_squared"])
+            if return_all_log_probs:
+                all_log_probs_lst.append(outputs["all_log_probs"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
         if calculate_sum_pi_squared:
             sum_pi_squared = torch.concat(sum_pi_squared_lst, dim=0)
+        if return_all_log_probs:
+            all_log_probs = torch.concat(all_log_probs_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
@@ -497,12 +549,16 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
             if calculate_sum_pi_squared:
                 sum_pi_squared = restore_dynamic_batch(sum_pi_squared, batch_idx_list)
+            if return_all_log_probs:
+                all_log_probs = restore_dynamic_batch(all_log_probs, batch_idx_list)
 
         outputs = {"log_probs": log_probs}
         if calculate_entropy:
             outputs["entropys"] = entropys
         if calculate_sum_pi_squared:
             outputs["sum_pi_squared"] = sum_pi_squared
+        if return_all_log_probs:
+            outputs["all_log_probs"] = all_log_probs
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
