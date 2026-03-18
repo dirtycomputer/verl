@@ -110,8 +110,8 @@ def fused_kl_from_logits(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torc
     Returns:
         Per-token KL divergence of shape (...), with the vocab dimension reduced.
     """
-    if not HAVE_TRITON:
-        # Fallback to PyTorch
+    if not HAVE_TRITON or not logits_p.is_cuda:
+        # Fallback to PyTorch (Triton requires CUDA tensors)
         return _kl_from_logits_pytorch(logits_p, logits_q)
 
     orig_shape = logits_p.shape[:-1]
