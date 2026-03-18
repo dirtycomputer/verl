@@ -2181,8 +2181,13 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
-        # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
-        raise NotImplementedError
+        # logprob and ref_logprob contain the logits for every token in vocabulary
+        # shape: (batch_size, response_length, vocab_size)
+        log_p = torch.nn.functional.log_softmax(logprob, dim=-1)
+        log_q = torch.nn.functional.log_softmax(ref_logprob, dim=-1)
+        # KL(π || π_ref) = Σ_v π(v) * (log π(v) - log π_ref(v))
+        kld = (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+        return torch.clamp(kld, min=0.0)
 
     raise NotImplementedError
 
